@@ -9,8 +9,8 @@ import React, { useState, useMemo, useRef, useEffect, useCallback, useContext, c
    EDIT ME: the link back to your main site, shown at the top left.
    Set HOME_URL to "" to hide the link entirely.
    --------------------------------------------------------------------------- */
-const HOME_URL = "https://example.com";
-const HOME_LABEL = "example.com";
+const HOME_URL = "https://haiko.be";
+const HOME_LABEL = "haiko.be";
 
 const THEME_CSS = `
 :root {
