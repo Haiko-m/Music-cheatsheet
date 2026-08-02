@@ -19,12 +19,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Vite 7 needs Node 20.19+ or 22+. No `cache: npm` here — the cache step
+      # fails outright when package-lock.json is missing, which is a confusing
+      # way to discover you forgot to commit it.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
-      - run: npm ci
-      - run: npm run build
+          node-version: 22
+
+      # `npm ci` is reproducible but demands a committed lockfile.
+      # Fall back rather than failing the run over it.
+      - name: Install
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "::warning::No package-lock.json committed — falling back to npm install."
+            npm install
+          fi
+
+      - name: Build
+        run: npm run build
+
+      - name: Check the build produced something
+        run: |
+          test -f dist/index.html || { echo "::error::dist/index.html missing — did vite build succeed?"; exit 1; }
+          ls -la dist
+
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
@@ -37,5 +58,8 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # If this step fails with "Get Pages site failed", go to
+      # Settings -> Pages -> Build and deployment -> Source: GitHub Actions,
+      # then re-run this workflow. The action cannot enable Pages for you.
       - id: deployment
         uses: actions/deploy-pages@v4
