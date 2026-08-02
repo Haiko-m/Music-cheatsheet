@@ -539,10 +539,25 @@ const GLOSSARY = [
   ["Headroom", "studio", "Space left before clipping. Aim to peak around −6 dB while mixing."],
 ];
 
-/* ============================== AUDIO ============================== */
+/* ============================== AUDIO ==============================
+   iOS notes, because they are the whole reason this file looks like this:
+
+   1. Safari routes Web Audio through the *ringer* channel, so the physical
+      Ring/Silent switch mutes it while ordinary media keeps playing. Since
+      iOS 16.4 that can be overridden with navigator.audioSession.type.
+   2. The context must be resumed inside a real user gesture, and the work
+      must be done SYNCHRONOUSLY. Awaiting resume() before creating nodes
+      moves the rest into a microtask, and iOS often refuses to unlock then.
+   3. Even with state === "running", output can stay silent until a
+      BufferSource has been started once. One 1-sample buffer does it.
+   4. Calls, alarms and backgrounding push the context into "interrupted",
+      which never recovers on its own.
+   ================================================================== */
 let AC = null;
 let TUNING = 440;
 let VOL = 0.85;
+let UNLOCKED = false;
+let SESSION_SET = false;
 let AUDIO_STATUS_LISTENER = null;
 
 const setTuning = (v) => { TUNING = v; };
@@ -551,6 +566,18 @@ const reportAudioStatus = (message) => {
   if (typeof AUDIO_STATUS_LISTENER === "function") AUDIO_STATUS_LISTENER(message);
 };
 
+/* Tell Safari this is playback audio, not a notification blip. Without this
+   the Ring/Silent switch silences everything. Harmless elsewhere. */
+function primeAudioSession() {
+  if (SESSION_SET) return;
+  try {
+    if (typeof navigator !== "undefined" && navigator.audioSession) {
+      navigator.audioSession.type = "playback";
+      SESSION_SET = true;
+    }
+  } catch (err) { /* not supported — the silent switch will still apply */ }
+}
+
 function getAudioContext() {
   if (typeof window === "undefined") return null;
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -558,12 +585,11 @@ function getAudioContext() {
     reportAudioStatus("Web Audio is not supported");
     return null;
   }
-
   if (!AC || AC.state === "closed") {
     try {
+      primeAudioSession();
       AC = new AudioContextClass();
       AC.onstatechange = () => reportAudioStatus("Audio: " + AC.state);
-      reportAudioStatus("Audio: " + AC.state);
     } catch (err) {
       console.error("AudioContext creation failed:", err);
       reportAudioStatus("Audio creation failed");
@@ -573,26 +599,42 @@ function getAudioContext() {
   return AC;
 }
 
-async function ensureAudio() {
+/* Synchronous. Safe to call on every tap — the expensive parts run once. */
+function unlockAudio() {
   const c = getAudioContext();
   if (!c) return null;
+  primeAudioSession();
 
-  try {
-    if (c.state === "suspended" || c.state === "interrupted") {
-      await c.resume();
-    }
-    reportAudioStatus("Audio: " + c.state);
-    return c;
-  } catch (err) {
-    console.error("Audio resume failed:", err);
-    reportAudioStatus("Audio resume failed");
-    return null;
+  if (c.state !== "running") {
+    try {
+      const p = c.resume();
+      if (p && typeof p.catch === "function") p.catch(() => reportAudioStatus("Audio resume failed"));
+    } catch (err) { reportAudioStatus("Audio resume failed"); }
   }
+
+  if (!UNLOCKED) {
+    try {
+      const src = c.createBufferSource();
+      src.buffer = c.createBuffer(1, 1, 22050);
+      src.connect(c.destination);
+      src.start(0);
+      UNLOCKED = true;
+    } catch (err) { /* retried on the next tap */ }
+  }
+  return c;
 }
 
-function ctx() {
-  return getAudioContext();
+/* Kept for callers that genuinely want to wait for the state to settle. */
+async function ensureAudio() {
+  const c = unlockAudio();
+  if (!c) return null;
+  if (c.state !== "running") {
+    try { await c.resume(); } catch (err) { return null; }
+  }
+  return c;
 }
+
+function ctx() { return unlockAudio(); }
 
 const freq = (m) => TUNING * Math.pow(2, (m - 69) / 12);
 const fOf = (m, a4) => a4 * Math.pow(2, (m - 69) / 12);
@@ -605,21 +647,34 @@ function nearestNote(f, a4) {
 
 function scheduleTone(c, midi, dur = 0.9, when = 0, vol = 0.18) {
   try {
-    const t = Math.max(c.currentTime + 0.02, c.currentTime + Math.max(0, when));
+    const t = c.currentTime + Math.max(0.02, when);
     const V = Math.max(0.00012, vol * VOL);
+    const D = Math.max(0.08, dur);
 
     const g = c.createGain();
-    g.connect(c.destination);
+    const lp = c.createBiquadFilter();
+    lp.type = "lowpass";
+    lp.frequency.setValueAtTime(4200, t);
+    lp.frequency.exponentialRampToValueAtTime(1100, t + D);
     g.gain.setValueAtTime(0.0001, t);
     g.gain.exponentialRampToValueAtTime(V, t + 0.015);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + Math.max(0.06, dur));
+    g.gain.exponentialRampToValueAtTime(0.0001, t + D);
+    lp.connect(g); g.connect(c.destination);
 
     const o = c.createOscillator();
     o.type = "triangle";
     o.frequency.setValueAtTime(freq(midi), t);
-    o.connect(g);
-    o.start(t);
-    o.stop(t + Math.max(0.08, dur) + 0.05);
+    o.connect(lp);
+
+    const o2 = c.createOscillator();
+    o2.type = "sine";
+    o2.frequency.setValueAtTime(freq(midi) * 2.002, t);
+    const g2 = c.createGain();
+    g2.gain.setValueAtTime(0.3, t);
+    o2.connect(g2); g2.connect(lp);
+
+    o.start(t); o2.start(t);
+    o.stop(t + D + 0.06); o2.stop(t + D + 0.06);
     return true;
   } catch (err) {
     console.error("Tone scheduling failed:", err);
@@ -628,45 +683,38 @@ function scheduleTone(c, midi, dur = 0.9, when = 0, vol = 0.18) {
   }
 }
 
-async function tone(midi, dur = 0.9, when = 0, vol = 0.18) {
-  const c = await ensureAudio();
-  if (!c || c.state !== "running") {
-    reportAudioStatus("Tap Enable sound");
-    return false;
-  }
+/* Synchronous on purpose: called straight from pointer handlers, so the
+   nodes are created inside the gesture. Notes scheduled while the context
+   is still starting are queued and play as soon as it runs. */
+function tone(midi, dur = 0.9, when = 0, vol = 0.18) {
+  const c = unlockAudio();
+  if (!c) return false;
   return scheduleTone(c, midi, dur, when, vol);
 }
 
-async function strum(midis, dur = 1.1, when = 0, vol = 0.15) {
-  const c = await ensureAudio();
-  if (!c || c.state !== "running") {
-    reportAudioStatus("Tap Enable sound");
-    return false;
-  }
+function strum(midis, dur = 1.1, when = 0, vol = 0.15) {
+  const c = unlockAudio();
+  if (!c) return false;
   return midis.every((m, i) => scheduleTone(c, m, dur, when + i * 0.012, vol));
 }
 
-async function sine(f, dur, when = 0, vol = 0.13) {
-  const c = await ensureAudio();
-  if (!c || c.state !== "running") {
-    reportAudioStatus("Tap Enable sound");
-    return false;
-  }
-
+function sine(f, dur, when = 0, vol = 0.13) {
+  const c = unlockAudio();
+  if (!c) return false;
   try {
-    const t = Math.max(c.currentTime + 0.02, c.currentTime + Math.max(0, when));
+    const t = c.currentTime + Math.max(0.02, when);
+    const D = Math.max(0.06, dur);
     const g = c.createGain();
     g.connect(c.destination);
     g.gain.setValueAtTime(0.0001, t);
     g.gain.exponentialRampToValueAtTime(Math.max(0.00012, vol * VOL), t + 0.015);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + Math.max(0.06, dur));
-
+    g.gain.exponentialRampToValueAtTime(0.0001, t + D);
     const o = c.createOscillator();
     o.type = "sine";
     o.frequency.setValueAtTime(f, t);
     o.connect(g);
     o.start(t);
-    o.stop(t + Math.max(0.08, dur) + 0.05);
+    o.stop(t + D + 0.05);
     return true;
   } catch (err) {
     console.error("Sine scheduling failed:", err);
@@ -1597,834 +1645,4 @@ function HarmonicsModule() {
   const playSeries = (list) => list.slice(0, 12).forEach((o, i) => sine(o.f, 0.5, i * 0.34));
   const ratioOf = (r) => { const m = r.match(/(\d+):(\d+)/); return m ? +m[1] / +m[2] : 1; };
   return (
-    <>
-      <Card title={`Overtones of ${rootName}2 · ${hz(f0)}`}
-        hint="Every real instrument playing this note also produces all of these, quietly, at the same time. This is where timbre comes from.">
-        <div className="mb-3"><Btn size="sm" tone="play" onClick={() => playSeries(overs)}>▶ Hear the series</Btn></div>
-        {overs.map((o) => (
-          <div key={o.n} className="border-b py-1.5" style={{ borderColor: "var(--line)" }}>
-            <div className="flex items-baseline justify-between gap-3">
-              <button type="button" onClick={() => sine(o.f, 0.8, 0)}
-                style={{ fontFamily: MONO, fontSize: 12, color: o.n === 1 ? "var(--root)" : "var(--text)" }}>
-                {o.n}× · {hz(o.f)}
-              </button>
-              <span style={{ fontFamily: MONO, fontSize: 12, color: "var(--scale)" }}>
-                {octName(o.nn.m, flat)}
-                <span style={{ color: Math.abs(o.nn.cents) > 12 ? "var(--warn)" : "var(--muted)" }}>
-                  {" "}{o.nn.cents >= 0 ? "+" : ""}{o.nn.cents}¢
-                </span>
-              </span>
-            </div>
-            <div className="text-xs" style={{ color: "var(--muted)" }}>{HARM_ROLE[o.n]}</div>
-          </div>
-        ))}
-        <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
-          Red cent values are harmonics a piano cannot play. The 7th and 11th are why brass, bells and overdriven guitars sound the way they do.
-        </p>
-      </Card>
-
-      <Card title="Undertones" hint="Divide instead of multiply. Nothing in nature does this, but sub oscillators and pitch-down effects do — and it spells a minor chord.">
-        <div className="mb-3"><Btn size="sm" tone="play" onClick={() => playSeries(unders)}>▶ Hear it</Btn></div>
-        {unders.map((o) => <Line key={o.n} label={"÷ " + o.n} value={hz(o.f)} sub={octName(o.nn.m, flat) + " " + (o.nn.cents >= 0 ? "+" : "") + o.nn.cents + "¢"} />)}
-        <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
-          A sub one or two octaves down (÷2, ÷4) is always safe. ÷3 and ÷5 give fifths and thirds below the note — huge, but they muddy fast.
-        </p>
-      </Card>
-
-      <Card title="Why intervals sound the way they do" hint="Simple ratios share harmonics, which the ear reads as consonance. Complex ratios leave harmonics slightly apart, and those near-misses beat as roughness.">
-        {RATIOS.map(([n, r, d]) => <Line key={n} label={n} value={r + " · " + hz(f0 * ratioOf(r))} sub={d} />)}
-      </Card>
-
-      <Card title="Waveforms and what is inside them">
-        {WAVEFORMS.map(([w, h, u]) => <Line key={w} label={w} value={h} sub={u} />)}
-      </Card>
-
-      <Card title="Resonance and filters">
-        <Def term="What it is">A filter boosting a narrow band at its cutoff. Turned up far enough it self-oscillates into a sine wave at the cutoff pitch.</Def>
-        <Def term="Keep it musical">Park the peak on a note of the key and sweeps stay in tune.</Def>
-        <Def term="Q values">0.7 gentle and natural · 2–4 obvious character · 8+ a whistle. High Q to cut problems, low Q to shape tone.</Def>
-        <Def term="Find a problem">Boost 12 dB with a narrow band, sweep until it screams, then cut 3–6 dB there.</Def>
-        <Def term="Formants">Two resonant peaks in the low mids make anything sound vocal:</Def>
-        <div className="mt-1">{FORMANTS.map(([v, f1, f2]) => <Line key={v} label={v} value={"F1 " + f1 + " · F2 " + f2} />)}</div>
-      </Card>
-
-      <Card title="Harmonic tricks worth stealing">
-        {HARM_TRICKS.map((t, i) => (
-          <p key={i} className="flex gap-2 py-1" style={{ fontSize: 14 }}>
-            <span style={{ color: "var(--scale)" }}>—</span><span>{t}</span>
-          </p>
-        ))}
-      </Card>
-    </>
-  );
-}
-
-/* ============================== MODULE: RHYTHM ============================== */
-function RhythmModule() {
-  const { bpm } = useDesk();
-  const beat = 60000 / bpm;
-  const rows = [["Whole note", 4], ["Half note", 2], ["Quarter note — 1 beat", 1], ["Eighth note", 0.5],
-    ["Dotted eighth", 0.75], ["Eighth triplet", 1 / 3], ["Sixteenth note", 0.25]];
-  return (
-    <>
-      <Card title={`Note lengths at ${bpm} BPM`} hint="Also your delay times. Change the tempo at the top of the page.">
-        {rows.map(([n, b]) => <Line key={n} label={n} value={Math.round(beat * b) + " ms"} />)}
-        <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
-          Set a delay to the eighth-note value for a rhythmic echo, or the dotted eighth for the classic wide guitar and synth sound.
-          A reverb pre-delay of one sixteenth keeps things from smearing.
-        </p>
-      </Card>
-
-      <Card title="Time signatures, in plain terms">
-        {TIME_SIGS.map((t) => (
-          <div key={t.sig} className="border-b py-2" style={{ borderColor: "var(--line)" }}>
-            <div className="flex items-baseline gap-2">
-              <span style={{ fontFamily: MONO, fontSize: 16, fontWeight: 700, color: "var(--root)" }}>{t.sig}</span>
-              <span className="text-xs" style={{ color: "var(--muted)" }}>“{t.say}”</span>
-            </div>
-            <div style={{ fontSize: 13 }}>{t.feel}</div>
-            <div className="text-xs" style={{ color: "var(--muted)" }}>{t.ex}</div>
-          </div>
-        ))}
-      </Card>
-
-      <Card title="Groove">
-        {GROOVE.map(([k, v]) => <Def key={k} term={k}>{v}</Def>)}
-      </Card>
-
-      <Card title="Typical tempo by genre">
-        <div className="grid grid-cols-1 gap-x-6 sm:grid-cols-2">
-          {GENRE_BPM.map(([g, b]) => <Line key={g} label={g} value={b} />)}
-        </div>
-      </Card>
-    </>
-  );
-}
-
-/* ============================== MODULE: MIXING ============================== */
-function MixingModule() {
-  return (
-    <>
-      <Card title="Dynamics — how loud to play" hint="The number is MIDI velocity, what you draw into a piano roll. Most DAWs default to 100, which is why programmed parts sound flat.">
-        {DYNAMICS.map(([sym, mean, vel]) => (
-          <div key={sym} className="flex items-center gap-3 border-b py-2" style={{ borderColor: "var(--line)" }}>
-            <span style={{ fontFamily: MONO, fontSize: 15, fontWeight: 700, color: "var(--root)", minWidth: 38 }}>{sym}</span>
-            <span className="flex-1" style={{ fontSize: 13 }}>{mean}</span>
-            <span className="rounded" style={{ width: 84, height: 6, background: "var(--raised)" }}>
-              <span className="block rounded" style={{ width: (vel / 127) * 100 + "%", height: 6, background: "var(--scale)" }} />
-            </span>
-            <span style={{ fontFamily: MONO, fontSize: 11, color: "var(--muted)", minWidth: 26, textAlign: "right" }}>{vel}</span>
-          </div>
-        ))}
-      </Card>
-      <Card title="Articulation">{ARTICULATION.map(([k, v]) => <Def key={k} term={k}>{v}</Def>)}</Card>
-      <Card title="Frequency ranges">{FREQ_BANDS.map(([r, n, d]) => <Line key={r} label={n} value={r} sub={d} />)}</Card>
-      <Card title="Where each instrument lives">{INSTRUMENT_RANGE.map(([i, r]) => <Line key={i} label={i} value={r} />)}</Card>
-    </>
-  );
-}
-
-/* ============================== MODULE: ARRANGEMENT ============================== */
-function ArrangementModule() {
-  return (
-    <>
-      <Card title="Sections of a track" hint="Sections almost always come in 4, 8 or 16 bars. Change something every 8th bar or attention drifts.">
-        {STRUCTURE.map(([s, len, d]) => <Line key={s} label={s} value={len} sub={d} />)}
-      </Card>
-      <Card title="The five things that matter most">
-        {PRINCIPLES.map((p, i) => (
-          <p key={i} className="flex gap-3 py-1.5" style={{ fontSize: 14 }}>
-            <span style={{ fontFamily: MONO, color: "var(--scale)" }}>{i + 1}</span><span>{p}</span>
-          </p>
-        ))}
-      </Card>
-    </>
-  );
-}
-
-/* ============================== MODULE: FIXES ============================== */
-function FixesModule() {
-  return (
-    <Card title="When something is not working" hint="The fastest way out of each common problem.">
-      {FIXES.map(([t, b]) => (
-        <div key={t} className="border-b py-2.5" style={{ borderColor: "var(--line)" }}>
-          <div style={{ fontSize: 14, fontWeight: 700, color: "var(--root)" }}>{t}</div>
-          <div style={{ fontSize: 14 }}>{b}</div>
-        </div>
-      ))}
-    </Card>
-  );
-}
-
-/* ============================== MODULE: GLOSSARY ============================== */
-function GlossaryModule() {
-  const [q, setQ] = useState("");
-  const groups = [["notes", "Notes and keys"], ["chords", "Chords"], ["studio", "Studio"]];
-  const hit = (t) => !q || (t[0] + " " + t[2]).toLowerCase().includes(q.toLowerCase());
-  return (
-    <>
-      <Card title="Glossary" hint="Plain-English definitions for everything this app uses.">
-        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter terms…" aria-label="Filter glossary"
-          className="w-full rounded-lg px-3"
-          style={{ height: 38, background: "var(--raised)", border: "1px solid var(--line)", fontSize: 14 }} />
-      </Card>
-      {groups.map(([g, title]) => {
-        const items = GLOSSARY.filter((t) => t[1] === g && hit(t));
-        if (!items.length) return null;
-        return (
-          <Card key={g} title={title}>
-            {items.map(([term, , def]) => <Def key={term} term={term}>{def}</Def>)}
-          </Card>
-        );
-      })}
-    </>
-  );
-}
-
-/* ============================== MODULE: NOTE ↔ TEMPO ============================== */
-/* A tempo is a very slow frequency. Double it enough times and it becomes a pitch,
-   so every note has a family of tempos that are literally in tune with it. */
-function tempoForPc(pc, a4, lo = 80) {
-  let b = 60 * fOf(60 + pc, a4);
-  while (b >= lo * 2) b /= 2;
-  while (b < lo) b *= 2;
-  return b;
-}
-function noteForBpm(bpm, a4) {
-  const beat = bpm / 60;
-  const n = Math.max(0, Math.round(Math.log2(90 / beat)));
-  const f = beat * Math.pow(2, n);
-  const nn = nearestNote(f, a4);
-  return { n, f, nn, exact: bpm * (fOf(nn.m, a4) / f) };
-}
-function TempoPitchModule() {
-  const { rootPc, flat, a4, bpm, setBpm, go } = useDesk();
-  const noteName = (m) => octName(m, flat);
-  const [pc, setPc] = useState(rootPc);
-  const base = tempoForPc(pc, a4);
-  const rev = noteForBpm(bpm, a4);
-  const off = Math.abs(rev.nn.cents);
-  const click = (t) => { for (let i = 0; i < 4; i++) sine(i === 0 ? 1400 : 900, 0.05, i * (60 / t), 0.1); };
-  return (
-    <>
-      <Card title="Tempo from a note" hint="Pick a note and get the tempos whose beat is that note, several octaves down.">
-        <div className="flex flex-wrap gap-1" role="group" aria-label="Note">
-          {Array.from({ length: 12 }, (_, p) => {
-            const on = p === pc;
-            return (
-              <button type="button" key={p} aria-pressed={on} onClick={() => { setPc(p); tone(60 + p, 0.7); }}
-                className="rounded-md"
-                style={{
-                  height: 40, minWidth: 46, fontFamily: MONO, fontSize: 14, fontWeight: on ? 700 : 500,
-                  background: on ? "var(--root)" : BLACK_PCS.includes(p) ? "var(--raised)" : "var(--surface)",
-                  color: on ? "var(--bg)" : "var(--text)",
-                  border: "1px solid " + (on ? "var(--root)" : "var(--line)"),
-                }}>{nameOf(p, flat)}</button>
-            );
-          })}
-        </div>
-
-        <div className="mt-4 flex flex-wrap items-end gap-x-4 gap-y-2">
-          <div>
-            <div style={{ fontFamily: MONO, fontSize: 34, fontWeight: 700, color: "var(--root)", lineHeight: 1 }}>
-              {base.toFixed(2)}
-            </div>
-            <div className="text-xs" style={{ color: "var(--muted)" }}>BPM for {nameOf(pc, flat)}</div>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Sound tone="scale" sub="half-time" onPlay={() => setBpm(Math.round(base / 2 * 10) / 10)}>{(base / 2).toFixed(2)}</Sound>
-            <Sound tone="scale" sub="double-time" onPlay={() => setBpm(Math.round(base * 2 * 10) / 10)}>{(base * 2).toFixed(2)}</Sound>
-          </div>
-        </div>
-
-        <div className="mt-3 flex flex-wrap gap-2">
-          <Btn size="sm" tone="root" onClick={() => setBpm(Math.round(base * 10) / 10)}>Use {base.toFixed(1)} BPM</Btn>
-          <Btn size="sm" tone="play" onClick={() => click(base)}>▶ Hear the click</Btn>
-          <Btn size="sm" tone="quiet" onClick={() => { tone(60 + pc, 1.1); }}>▶ Hear the note</Btn>
-        </div>
-        <p className="mt-3 text-xs" style={{ color: "var(--muted)" }}>
-          Set to {base.toFixed(2)} and the beat, its subdivisions, and any tempo-synced LFO all line up with
-          {" "}{nameOf(pc, flat)} — {hz(fOf(24 + pc, a4))} at octave 1. Most DAWs accept two decimal places;
-          rounding to a whole number puts you a few cents out, which only matters if something is meant to resonate.
-        </p>
-      </Card>
-
-      <Card title="All twelve notes as tempos" hint={`Tuning reference A4 = ${a4} Hz. Tap to set the tempo.`}>
-        {Array.from({ length: 12 }, (_, p) => {
-          const b = tempoForPc(p, a4);
-          return (
-            <Line key={p} active={p === pc}
-              label={nameOf(p, flat)}
-              sub={`half ${(b / 2).toFixed(2)} · double ${(b * 2).toFixed(2)}`}
-              value={b.toFixed(2) + " BPM"}
-              onClick={() => { setPc(p); setBpm(Math.round(b * 10) / 10); }} />
-          );
-        })}
-      </Card>
-
-      <Card title="Note from your tempo" hint={`Working backwards from ${bpm} BPM.`}>
-        <Def term="Beat rate">{(bpm / 60).toFixed(3)} Hz — that is the tempo expressed as a frequency.</Def>
-        <Def term="Doubled up">× 2^{rev.n} = {hz(rev.f)}, which lands in the bass register.</Def>
-        <Def term="Nearest note">
-          <span style={{ fontFamily: MONO, color: "var(--scale)" }}>{noteName(rev.nn.m)}</span>{" "}
-          <span style={{ color: off > 10 ? "var(--warn)" : "var(--muted)" }}>
-            {rev.nn.cents >= 0 ? "+" : ""}{rev.nn.cents} cents
-          </span>
-          {off <= 3 ? " — effectively in tune already." : " — audible as detuning if something resonates at this pitch."}
-        </Def>
-        <Def term="Exact tempo">{rev.exact.toFixed(2)} BPM would put the beat exactly in tune with {noteName(rev.nn.m)}.</Def>
-        <div className="mt-2 flex flex-wrap gap-2">
-          <Btn size="sm" tone="root" onClick={() => setBpm(Math.round(rev.exact * 10) / 10)}>Snap to {rev.exact.toFixed(1)}</Btn>
-          <Btn size="sm" tone="quiet" onClick={() => go("frequencies")}>Full frequency table</Btn>
-        </div>
-      </Card>
-
-      <Card title="What this is for">
-        <Def term="Kick and 808">Tune the kick to the key, then set the tempo from the same note, and the low end stops beating against the pulse.</Def>
-        <Def term="LFOs and tremolo">A free-running LFO set in Hz will drift against the grid. Derive its rate from the beat and it never does.</Def>
-        <Def term="Drones and risers">A drone at the tempo's own pitch sits under everything without ever clashing.</Def>
-        <Def term="Repitching samples">Speeding a sample up by n semitones multiplies its tempo by 2^(n/12). Use the table to find the target.</Def>
-        <Def term="Honestly">This is a subtle effect. Use it when something feels almost-but-not-quite locked, not as a rule.</Def>
-      </Card>
-    </>
-  );
-}
-
-/* ============================== SCRATCHPAD ============================== */
-const ROWS = 25, CW = 24, CH = 14;
-const ScratchGrid = React.memo(function ScratchGrid({ steps, base, notes, scalePcs, flat, onToggle, onPreview }) {
-  const cells = {};
-  notes.forEach((n) => { for (let k = 0; k < n.len; k++) cells[n.row + ":" + (n.step + k)] = true; });
-  return (
-    <div style={{ width: 42 + steps * CW }}>
-      {Array.from({ length: ROWS }, (_, i) => ROWS - 1 - i).map((row) => {
-        const midi = base + row, pc = midi % 12;
-        const inScale = scalePcs.includes(pc), isRoot = pc === scalePcs[0];
-        const black = BLACK_PCS.includes(pc);
-        const label = octName(midi, flat);
-        return (
-          <div key={row} className="flex" style={{ height: CH }}>
-            <button type="button" onPointerDown={() => onPreview(row)} aria-label={"Preview " + label}
-              className="sticky left-0 z-10 shrink-0"
-              style={{
-                width: 42, background: black ? "var(--surface)" : "var(--raised)",
-                borderTop: "1px solid var(--bg)", borderRight: "1px solid var(--line)",
-                color: isRoot ? "var(--root)" : inScale ? "var(--text)" : "var(--faint)",
-                fontFamily: MONO, fontSize: 9, textAlign: "right", paddingRight: 4,
-              }}>{label}</button>
-            {Array.from({ length: steps }, (_, s) => (
-              <button type="button" key={s} onPointerDown={() => onToggle(row, s)}
-                aria-label={label + " step " + (s + 1)} aria-pressed={!!cells[row + ":" + s]}
-                style={{
-                  width: CW, height: CH, flexShrink: 0,
-                  background: cells[row + ":" + s] ? (isRoot ? "var(--root)" : "var(--chord)")
-                    : inScale ? (black ? "var(--surface)" : "var(--raised)") : "var(--bg)",
-                  borderTop: "1px solid var(--bg)",
-                  borderLeft: "1px solid " + (s % 16 === 0 ? "var(--line)" : s % 4 === 0 ? "var(--surface)" : "transparent"),
-                }} />
-            ))}
-          </div>
-        );
-      })}
-    </div>
-  );
-});
-
-function Scratchpad({ state, set, base, scalePcs, scale, flat, rootName, bpm, setKeys, panelRef }) {
-  const { notes, bars, open } = state;
-  const steps = bars * 16;
-  const [len, setLen] = useState(4);
-  const [playStep, setPlayStep] = useState(-1);
-  const [playing, setPlaying] = useState(false);
-  const msg = state.msg || "";
-  const setMsg = useCallback((m) => set((s) => ({ ...s, msg: m })), [set]);
-  const iv = useRef(null);
-  const live = useRef({});
-  live.current = { notes, steps, len, base, bpm };
-
-  useEffect(() => () => clearInterval(iv.current), []);
-  useEffect(() => { set((s) => (s.notes.some((n) => n.step >= steps) ? { ...s, notes: s.notes.filter((n) => n.step < steps) } : s)); }, [steps, set]);
-
-  const stop = useCallback(() => { clearInterval(iv.current); iv.current = null; setPlaying(false); setPlayStep(-1); setKeys(null); }, [setKeys]);
-  useEffect(() => { if (playing) stop(); /* eslint-disable-next-line */ }, [bpm, steps]);
-
-  const play = async () => {
-    if (playing) return stop();
-    const c = await ensureAudio();
-    if (!c) { setMsg("Audio could not be started. Tap a key once and try again."); return; }
-    const stepDur = 60 / live.current.bpm / 4;
-    const t0 = c.currentTime + 0.12;
-    const fire = (s, abs) => {
-      const due = live.current.notes.filter((n) => n.step === s);
-      due.forEach((n) => tone(live.current.base + n.row, stepDur * n.len * 0.92, Math.max(0, t0 + abs * stepDur - c.currentTime), 0.15));
-      if (due.length) setKeys(uniq(due.map((n) => (live.current.base + n.row) % 12)).sort((a, b) => a - b));
-    };
-    setPlaying(true); setPlayStep(0); fire(0, 0);
-    let abs = 0;
-    iv.current = setInterval(() => { abs += 1; const s = abs % live.current.steps; setPlayStep(s); fire(s, abs); }, stepDur * 1000);
-  };
-
-  const onToggle = useCallback((row, s) => {
-    set((st) => {
-      const hit = st.notes.find((n) => n.row === row && s >= n.step && s < n.step + n.len);
-      if (hit) return { ...st, notes: st.notes.filter((n) => n !== hit) };
-      return { ...st, notes: [...st.notes, { row, step: s, len: Math.max(1, Math.min(live.current.len, live.current.steps - s)) }] };
-    });
-    tone(live.current.base + row, 0.45);
-  }, [set]);
-  const onPreview = useCallback((row) => tone(live.current.base + row, 0.7), []);
-
-  const loadScale = () => {
-    const seq = [...scale.iv, 12];
-    set({ open: true, msg: "Scale written to the scratchpad", bars: Math.min(4, Math.max(1, Math.ceil((seq.length * 2) / 16))), notes: seq.map((x, i) => ({ row: Math.min(24, x + 12), step: i * 2, len: 2 })) });
-  };
-  const exportMidi = () => {
-    if (!notes.length) { setMsg("Nothing to export — tap the grid first."); return; }
-    const nm = `${rootName}-${scale.name}-sketch`;
-    setMsg(downloadMidi(notes.map((n) => ({ tick: n.step * (PPQ / 4), dur: Math.max(20, n.len * (PPQ / 4) - 10), midi: base + n.row, vel: 100 })), bpm, nm)
-      ? "Saved " + safeName(nm) + ".mid" : "Your browser blocked the download — open this page in its own window.");
-  };
-
-  return (
-    <section ref={panelRef} className="rounded-xl p-3" style={{ background: "var(--surface)", border: "1px dashed var(--line)" }}>
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <button type="button" onClick={() => set((s) => ({ ...s, open: !s.open }))} aria-expanded={open} className="flex items-center gap-2">
-          <span style={{ color: "var(--muted)", fontSize: 12 }}>{open ? "▾" : "▸"}</span>
-          <span style={{ fontFamily: SERIF, fontSize: 15 }}>Scratchpad</span>
-          <span style={{ fontFamily: MONO, fontSize: 11, color: "var(--muted)" }}>{notes.length} notes · {bars} bar{bars > 1 ? "s" : ""}</span>
-        </button>
-        <div className="flex flex-wrap gap-2">
-          <Btn size="sm" tone="play" onClick={play}>{playing ? "■ Stop" : "▶ Play"}</Btn>
-          <Btn size="sm" onClick={exportMidi}>↓ .mid</Btn>
-        </div>
-      </div>
-      <p className="mt-1 text-xs" style={{ color: "var(--muted)" }}>
-        Not a sequencer — somewhere to try a lookup out and export it as MIDI.
-        {notes.length === 0 && " Use the + button on any chord to drop it in."}
-      </p>
-      {open && (
-        <>
-          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
-            <div className="flex items-center gap-2">
-              <span className="text-xs" style={{ color: "var(--muted)" }}>Bars</span>
-              <Choice ariaLabel="Bars" value={bars} onChange={(v) => set((s) => ({ ...s, bars: v }))} options={[1, 2, 3, 4].map((b) => [b, String(b)])} />
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs" style={{ color: "var(--muted)" }}>Note</span>
-              <Choice ariaLabel="Note length" tone="chord" value={len} onChange={setLen}
-                options={[[1, "1/16"], [2, "1/8"], [4, "1/4"], [8, "1/2"], [16, "bar"]]} />
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs" style={{ color: "var(--muted)" }}>Added chords</span>
-              <Choice ariaLabel="Chord length" value={state.chordLen || 16} onChange={(v) => set((s) => ({ ...s, chordLen: v }))}
-                options={[[4, "1 beat"], [8, "½ bar"], [16, "1 bar"]]} />
-            </div>
-          </div>
-          <div className="td-scroll td-scroll-both relative mt-2 overflow-auto rounded-lg" style={{ maxHeight: 250, border: "1px solid var(--line)" }}>
-            <div className="relative" style={{ width: 42 + steps * CW, paddingBottom: 4 }}>
-              {playStep >= 0 && (
-                <div className="pointer-events-none absolute top-0 z-20" aria-hidden="true"
-                  style={{ left: 42 + playStep * CW, width: CW, height: "100%", background: "rgba(232,179,60,.18)", borderLeft: "1px solid var(--root)" }} />
-              )}
-              <ScratchGrid {...{ steps, base, notes, scalePcs, flat, onToggle, onPreview }} />
-            </div>
-          </div>
-          <div className="mt-2 flex flex-wrap gap-2">
-            <Btn size="sm" tone="quiet" onClick={loadScale}>Load the scale</Btn>
-            <Btn size="sm" tone="warn" onClick={() => { stop(); set((s) => ({ ...s, notes: [], msg: "" })); }}>Clear</Btn>
-          </div>
-        </>
-      )}
-      {msg && <p className="mt-2 text-xs" style={{ color: "var(--scale)" }}>{msg}</p>}
-    </section>
-  );
-}
-
-/* ============================== SEARCH ============================== */
-const SEARCH_INDEX = [
-  ...MODULES.map((m) => ({ kind: "Page", label: m.name, sub: m.lede, extra: m.kw, act: { go: m.id } })),
-  ...SCALES.map((s) => ({ kind: "Scale", label: s.name, sub: s.feel, extra: s.use, act: { scale: s.id, go: "scales" } })),
-  ...CHORDS.map((c) => ({ kind: "Chord", label: (c.sym === "" ? "major" : c.sym) + " · " + c.name, sub: c.feel, extra: c.id, act: { chord: c.id, go: "chordtypes" } })),
-  ...PROGS.map((p) => ({ kind: "Progression", label: p.name, sub: p.feel, extra: p.tag + " " + p.heard, act: { prog: p.id, go: "progressions" } })),
-  ...MOODS.map((m) => ({ kind: "Feeling", label: m.name, sub: "Scale, chords, tempo and tips for this mood", extra: "mood", act: { go: "feel" } })),
-  ...INTERVALS.map((i) => ({ kind: "Interval", label: i.name, sub: i.feel, extra: i.short + " " + i.song, act: { go: "intervals" } })),
-  ...GLOSSARY.map((g) => ({ kind: "Term", label: g[0], sub: g[2], extra: "glossary definition", act: { go: "glossary" } })),
-];
-function search(q) {
-  const s = q.trim().toLowerCase();
-  if (!s) return [];
-  const score = (e) => {
-    const l = e.label.toLowerCase();
-    if (l === s) return 0;
-    if (l.startsWith(s)) return 1;
-    if (l.includes(s)) return 2;
-    if ((e.sub + " " + (e.extra || "")).toLowerCase().includes(s)) return 3;
-    return 99;
-  };
-  return SEARCH_INDEX.map((e) => ({ e, s: score(e) })).filter((x) => x.s < 99)
-    .sort((a, b) => a.s - b.s).slice(0, 12).map((x) => x.e);
-}
-
-/* ============================== APP SHELL ============================== */
-const PANES = {
-  identify: IdentifyModule, tempopitch: TempoPitchModule, feel: FeelModule, scales: ScalesModule, intervals: IntervalsModule,
-  circle: CircleModule, chordtypes: ChordTypesModule, inkey: InKeyModule, progressions: ProgressionsModule,
-  frequencies: FrequenciesModule, harmonics: HarmonicsModule, rhythm: RhythmModule,
-  mixing: MixingModule, arrangement: ArrangementModule, fixes: FixesModule, glossary: GlossaryModule,
-};
-
-export default function App() {
-  const [audioStatus, setAudioStatus] = useState("Sound not enabled");
-
-  useEffect(() => {
-    AUDIO_STATUS_LISTENER = setAudioStatus;
-    if (AC) setAudioStatus("Audio: " + AC.state);
-
-    const restore = () => {
-      if (document.visibilityState === "visible" && AC) void ensureAudio();
-    };
-    document.addEventListener("visibilitychange", restore);
-
-    return () => {
-      document.removeEventListener("visibilitychange", restore);
-      AUDIO_STATUS_LISTENER = null;
-    };
-  }, []);
-
-  const enableSound = async () => {
-    const c = await ensureAudio();
-    if (!c || c.state !== "running") return;
-
-    // Audible confirmation generated directly after the user gesture.
-    scheduleTone(c, 69, 0.18, 0, 0.14);
-    setAudioStatus("Audio: running");
-  };
-
-  const [theme, setTheme] = useState("dark");
-  const [rootPc, setRootPc] = useState(0);
-  const [flat, setFlat] = useState(false);
-  const [scaleId, setScaleId] = useState("minor");
-  const [chordId, setChordId] = useState("min");
-  const [sevenths, setSevenths] = useState(false);
-  const [progId, setProgId] = useState("axis");
-  const [bpm, setBpm] = useState(100);
-  const [a4, setA4] = useState(440);
-  const [vol, setVol] = useState(0.85);
-  const [showKeys, setShowKeys] = useState(true);
-  const [settings, setSettings] = useState(false);
-  const [query, setQuery] = useState(null);
-  const [mod, setMod] = useState("scales");
-  const [sel, setSel] = useState([]);
-  const [held, setHeld] = useState(null);
-  const [playingStep, setPlayingStep] = useState(-1);
-  const [pad, setPad] = useState({ notes: [], bars: 2, open: false, msg: "", chordLen: 16 });
-  const timers = useRef([]);
-  const padRef = useRef(null);
-  const guard = useRef({ t: 0, k: "" });
-
-  useEffect(() => { setTuning(a4); }, [a4]);
-  useEffect(() => { setVolume(vol); }, [vol]);
-  useEffect(() => () => timers.current.forEach(clearTimeout), []);
-
-  const scale = SCALE_BY_ID[scaleId] || SCALES[0];
-  const rootName = nameOf(rootPc, flat);
-  const notes = useMemo(() => spellScale(rootName, scale.iv, flat), [rootName, scale, flat]);
-  const degs = useMemo(() => degreeLabels(scale.iv), [scale]);
-  const scalePcs = useMemo(() => scale.iv.map((x) => (rootPc + x) % 12), [scale, rootPc]);
-  const picking = mod === "identify";
-  const module = MODULE_BY_ID[mod];
-  const Pane = PANES[mod];
-
-  const clearTimers = () => { timers.current.forEach(clearTimeout); timers.current = []; setPlayingStep(-1); };
-  const flash = (pcs, labels, color, root) => {
-    clearTimers();
-    setHeld({ pcs, labels, color, root });
-    timers.current.push(setTimeout(() => setHeld(null), 1700));
-  };
-  const setKeys = useCallback((pcs) => {
-    if (!pcs) { guard.current = { t: 0, k: "" }; setHeld(null); return; }
-    const k = pcs.join(","), now = Date.now();
-    if (k === guard.current.k || now - guard.current.t < 90) return;
-    guard.current = { t: now, k };
-    setHeld({ pcs, labels: pcs.map((p) => nameOf(p, flat)), color: "var(--chord)", root: rootPc });
-  }, [flat, rootPc]);
-
-  const hear = useMemo(() => ({
-    chord: (pc, iv, labels) => {
-      strum(voice(pc, iv), 1.5);
-      const u = [], lab = [];
-      iv.map((x) => (pc + x) % 12).forEach((p, i) => { if (!u.includes(p)) { u.push(p); lab.push(labels ? labels[i] : nameOf(p, flat)); } });
-      flash(u, lab, "var(--chord)", pc);
-    },
-    scale: () => {
-      const base = 60 + rootPc > 66 ? 48 + rootPc : 60 + rootPc;
-      [...scale.iv, 12].forEach((x, i) => tone(base + x, 0.5, i * 0.26));
-      flash(scalePcs, notes, "var(--scale)", rootPc);
-    },
-    prog: (prog) => {
-      clearTimers();
-      const step = (60 / bpm) * 2;
-      prog.steps.forEach((s, i) => {
-        const ct = CHORD_BY_ID[s.type] || CHORDS[0];
-        const pc = (rootPc + s.semi) % 12;
-        strum(voice(pc, ct.iv), step * 1.15, i * step);
-        timers.current.push(setTimeout(() => {
-          setPlayingStep(i);
-          const pcs = uniq(ct.iv.map((x) => (pc + x) % 12));
-          setHeld({ pcs, labels: pcs.map((p) => nameOf(p, flat)), color: "var(--chord)", root: pc });
-        }, i * step * 1000));
-      });
-      timers.current.push(setTimeout(() => { setPlayingStep(-1); setHeld(null); }, prog.steps.length * step * 1000 + 400));
-    },
-  }), [rootPc, scale, scalePcs, notes, flat, bpm]);
-
-  const go = useCallback((id) => { clearTimers(); setHeld(null); setMod(id); setQuery(null); if (typeof window !== "undefined" && window.scrollTo) { try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch (e) {} } }, []);
-  const padBase = 48 + rootPc;
-  const revealPad = () => setTimeout(() => { const el = padRef.current; if (el && el.scrollIntoView) el.scrollIntoView({ block: "nearest", behavior: "smooth" }); }, 60);
-  const scratch = useMemo(() => ({
-    addChord: (pc, iv, label) => {
-      const base = 48 + rootPc;
-      const rows = uniq(voice(pc, iv).map((m) => { let r = m - base; while (r > 24) r -= 12; while (r < 0) r += 12; return r; }));
-      setPad((p) => {
-        const len = p.chordLen || 16;
-        const used = p.notes.reduce((m, n) => Math.max(m, n.step + n.len), 0);
-        const start = Math.ceil(used / len) * len;
-        let bars = p.bars;
-        while (start + len > bars * 16 && bars < 4) bars += 1;
-        if (start + len > bars * 16)
-          return { ...p, open: true, msg: "Scratchpad is full — clear it, or set a shorter chord length." };
-        return {
-          ...p, open: true, bars,
-          notes: [...p.notes, ...rows.map((r) => ({ row: r, step: start, len }))],
-          msg: (label || "Chord") + " added at bar " + (Math.floor(start / 16) + 1) + ", beat " + ((start % 16) / 4 + 1),
-        };
-      });
-      strum(voice(pc, iv), 1.1);
-      revealPad();
-    },
-    loadProg: (prog) => {
-      const bars = Math.min(4, Math.max(1, prog.steps.length));
-      const out = [];
-      prog.steps.slice(0, bars).forEach((s, i) => {
-        const ct = CHORD_BY_ID[s.type] || CHORDS[0];
-        voice((rootPc + s.semi) % 12, ct.iv).forEach((m) => {
-          let r = m - (48 + rootPc);
-          while (r > 24) r -= 12;
-          while (r < 0) r += 12;
-          if (!out.some((n) => n.row === r && n.step === i * 16)) out.push({ row: r, step: i * 16, len: 16 });
-        });
-      });
-      setPad({ notes: out, bars, open: true, msg: prog.name + " written to the scratchpad" });
-      revealPad();
-    },
-  }), [rootPc]);
-
-  const paint = (pc) => {
-    if (picking) return sel.includes(pc) ? { color: "var(--warn)", label: nameOf(pc, flat) } : null;
-    if (held) {
-      const i = held.pcs.indexOf(pc);
-      return i >= 0 ? { color: pc === held.root ? "var(--root)" : held.color, label: held.labels[i] } : null;
-    }
-    const i = scalePcs.indexOf(pc);
-    return i < 0 ? null : { color: i === 0 ? "var(--root)" : "var(--scale)", label: notes[i] };
-  };
-
-  const results = query ? search(query) : [];
-  const applyResult = (e) => {
-    if (e.act.scale) setScaleId(e.act.scale);
-    if (e.act.chord) setChordId(e.act.chord);
-    if (e.act.prog) setProgId(e.act.prog);
-    go(e.act.go);
-  };
-
-  const ctxValue = {
-    rootPc, setRootPc, rootName, flat, setFlat, scaleId, setScaleId, scale, notes, degs, scalePcs,
-    chordId, setChordId, sevenths, setSevenths, progId, setProgId, bpm, setBpm, a4, setA4,
-    sel, setSel, picking, go, hear, flash, playingStep, scratch,
-  };
-
-  return (
-    <Ctx.Provider value={ctxValue}>
-      <div data-theme={theme} className="min-h-screen w-full" style={{ background: "var(--bg)", color: "var(--text)", fontFamily: SANS }}>
-        <style>{THEME_CSS}</style>
-
-        {/* ---------- header: the constant readout ---------- */}
-        <header className="sticky top-0 z-30" style={{ background: "var(--bg)", borderBottom: "1px solid var(--line)" }}>
-          <div className="mx-auto max-w-3xl px-3 pt-2">
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex min-w-0 items-center gap-2">
-                {HOME_URL && (
-                  <a href={HOME_URL} aria-label={"Back to " + HOME_LABEL} className="shrink-0 rounded-md px-2"
-                    style={{
-                      display: "inline-block", height: 24, lineHeight: "22px", fontSize: 11,
-                      color: "var(--muted)", border: "1px solid var(--line)", whiteSpace: "nowrap",
-                    }}>
-                    ← {HOME_LABEL}
-                  </a>
-                )}
-                <span className="truncate" style={{ fontFamily: MONO, fontSize: 9, letterSpacing: ".28em", color: "var(--muted)" }}>THEORY DESK</span>
-              </div>
-              <div className="flex items-center gap-1">
-                <Btn size="sm" tone="play" label="Enable sound" onClick={enableSound}>Enable sound</Btn>
-                <Btn size="sm" tone="quiet" label="Search" onClick={() => setQuery(query === null ? "" : null)}>Search</Btn>
-                <Btn size="sm" tone="quiet" label={vol > 0 ? "Mute" : "Unmute"} onClick={() => setVol(vol > 0 ? 0 : 0.85)}>{vol > 0 ? "♪" : "✕♪"}</Btn>
-                <Btn size="sm" tone="quiet" label="Settings" pressed={settings} onClick={() => setSettings(!settings)}>⚙</Btn>
-              </div>
-            </div>
-
-            <div className="mt-1 text-right" style={{ fontFamily: MONO, fontSize: 10, color: audioStatus === "Audio: running" ? "var(--scale)" : "var(--muted)" }}>
-              {audioStatus}
-            </div>
-
-            <div className="mt-0.5 flex flex-wrap items-baseline gap-x-3">
-              <span style={{ fontFamily: SERIF, fontSize: 26, color: "var(--root)", lineHeight: 1.2 }}>{rootName}</span>
-              <span style={{ fontFamily: SERIF, fontSize: 17 }}>{scale.name.toLowerCase()}</span>
-              <span className="text-xs" style={{ color: "var(--muted)" }}>{notes.join(" ")}</span>
-            </div>
-
-            {showKeys && (
-              <div className="mt-2">
-                <Keyboard octaves={2} base={60} paint={paint} flat={flat} height={92}
-                  onKey={(m) => { tone(m, 0.9); if (picking) setSel((p) => (p.includes(m % 12) ? p.filter((x) => x !== m % 12) : [...p, m % 12])); }} />
-              </div>
-            )}
-
-            {picking && (
-              <div className="mt-1.5 flex items-center justify-between gap-2 rounded-md px-2 py-1"
-                style={{ border: "1px solid var(--warn)" }}>
-                <span style={{ fontSize: 11, color: "var(--warn)" }}>Selection mode — tap keys to pick notes ({sel.length})</span>
-                {sel.length > 0 && <Btn size="sm" tone="quiet" onClick={() => setSel([])}>Clear</Btn>}
-              </div>
-            )}
-
-            <div className="td-scroll td-scroll-x mt-2 flex gap-1 overflow-x-auto" role="group" aria-label="Root note">
-              {Array.from({ length: 12 }, (_, pc) => {
-                const on = pc === rootPc;
-                return (
-                  <button type="button" key={pc} onClick={() => setRootPc(pc)} aria-pressed={on} aria-label={"Key of " + nameOf(pc, flat)}
-                    className="shrink-0 rounded-md"
-                    style={{
-                      height: 32, minWidth: 40, fontFamily: MONO, fontSize: 12, fontWeight: on ? 700 : 500,
-                      background: on ? "var(--root)" : "transparent", color: on ? "var(--bg)" : BLACK_PCS.includes(pc) ? "var(--muted)" : "var(--text)",
-                      border: "1px solid " + (on ? "var(--root)" : "var(--line)"),
-                    }}>{nameOf(pc, flat)}</button>
-                );
-              })}
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2 pb-2.5">
-              <select aria-label="Scale" value={scaleId} onChange={(e) => setScaleId(e.target.value)}
-                className="rounded-lg px-2"
-                style={{ height: 34, flex: "1 1 150px", background: "var(--raised)", border: "1px solid var(--line)", fontSize: 13 }}>
-                {SCALES.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-              </select>
-              <BpmControl bpm={bpm} setBpm={setBpm} />
-            </div>
-
-            {settings && (
-              <div className="mb-2 flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg p-2"
-                style={{ background: "var(--surface)", border: "1px solid var(--line)" }}>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs" style={{ color: "var(--muted)" }}>Names</span>
-                  <Choice ariaLabel="Note names" value={flat ? "b" : "s"} onChange={(v) => setFlat(v === "b")} options={[["s", "♯"], ["b", "♭"]]} />
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs" style={{ color: "var(--muted)" }}>A4</span>
-                  <Choice ariaLabel="Tuning reference" value={a4} onChange={setA4} options={[432, 440, 442, 444].map((v) => [v, String(v)])} />
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs" style={{ color: "var(--muted)" }}>Theme</span>
-                  <Choice ariaLabel="Theme" value={theme} onChange={setTheme} options={[["dark", "Dark"], ["paper", "Paper"]]} />
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs" style={{ color: "var(--muted)" }}>Keyboard</span>
-                  <Choice ariaLabel="Show keyboard" value={showKeys ? "y" : "n"} onChange={(v) => setShowKeys(v === "y")} options={[["y", "Show"], ["n", "Hide"]]} />
-                </div>
-                <div className="flex flex-1 items-center gap-2" style={{ minWidth: 140 }}>
-                  <span className="text-xs" style={{ color: "var(--muted)" }}>Volume</span>
-                  <input type="range" min={0} max={1} step={0.05} value={vol} onChange={(e) => setVol(+e.target.value)}
-                    aria-label="Volume" className="flex-1" style={{ accentColor: "var(--scale)" }} />
-                </div>
-              </div>
-            )}
-          </div>
-        </header>
-
-        {/* ---------- search ---------- */}
-        {query !== null && (
-          <div className="mx-auto max-w-3xl px-3 pt-3">
-            <Card>
-              <input autoFocus value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Search the reference"
-                placeholder="Search scales, chords, terms, tempos…" className="w-full rounded-lg px-3"
-                style={{ height: 40, background: "var(--raised)", border: "1px solid var(--line)", fontSize: 15 }} />
-              {query.trim() !== "" && (
-                <div className="mt-2">
-                  {results.length === 0 && <p className="py-2 text-sm" style={{ color: "var(--muted)" }}>Nothing found.</p>}
-                  {results.map((e, i) => (
-                    <Line key={i} label={e.label} sub={e.sub} value={e.kind} onClick={() => applyResult(e)} />
-                  ))}
-                </div>
-              )}
-            </Card>
-          </div>
-        )}
-
-        {/* ---------- navigation ---------- */}
-        <nav className="mx-auto max-w-3xl px-3 pt-3">
-          <div className="td-scroll td-scroll-x flex gap-1 overflow-x-auto" role="group" aria-label="Sections">
-            {CATS.map((c) => {
-              const on = module.cat === c.id;
-              return (
-                <button type="button" key={c.id} aria-pressed={on}
-                  onClick={() => go(MODULES.find((m) => m.cat === c.id).id)}
-                  className="shrink-0 rounded-lg px-3"
-                  style={{
-                    height: 34, fontSize: 13, fontFamily: SERIF,
-                    background: on ? "var(--text)" : "transparent", color: on ? "var(--bg)" : "var(--muted)",
-                    border: "1px solid " + (on ? "var(--text)" : "var(--line)"),
-                  }}>{c.name}</button>
-              );
-            })}
-          </div>
-          <div className="flex flex-wrap gap-1 pt-1">
-            {MODULES.filter((m) => m.cat === module.cat).map((m) => {
-              const on = m.id === mod;
-              return (
-                <button type="button" key={m.id} aria-current={on ? "page" : undefined} onClick={() => go(m.id)}
-                  className="rounded-md px-2.5"
-                  style={{
-                    height: 30, fontSize: 12, fontWeight: on ? 700 : 500,
-                    background: on ? "var(--raised)" : "transparent",
-                    color: on ? "var(--text)" : "var(--muted)",
-                    border: "1px solid " + (on ? "var(--line)" : "transparent"),
-                  }}>{m.name}</button>
-              );
-            })}
-          </div>
-        </nav>
-
-        {/* ---------- the reference page ---------- */}
-        <main className="mx-auto max-w-3xl px-3 pb-6 pt-4">
-          <h1 style={{ fontFamily: SERIF, fontSize: 22, lineHeight: 1.2 }}>{module.name}</h1>
-          <p className="mt-1 text-sm" style={{ color: "var(--muted)" }}>{module.lede}</p>
-          <div className="mt-4 space-y-3">
-            <Pane />
-          </div>
-
-          <div className="mt-4 flex flex-wrap items-center gap-2">
-            <span className="text-xs uppercase" style={{ letterSpacing: ".14em", color: "var(--muted)" }}>See also</span>
-            {(SEE_ALSO[mod] || []).map((id) => (
-              <Btn key={id} size="sm" tone="quiet" onClick={() => go(id)}>{MODULE_BY_ID[id].name}</Btn>
-            ))}
-          </div>
-        </main>
-
-        {/* ---------- scratchpad ---------- */}
-        <div className="mx-auto max-w-3xl px-3 pb-10">
-          <Scratchpad state={pad} set={setPad} base={padBase} scalePcs={scalePcs} scale={scale}
-            flat={flat} rootName={rootName} bpm={bpm} setKeys={setKeys} panelRef={padRef} />
-        </div>
-      </div>
-    </Ctx.Provider>
-  );
-}
+ 
